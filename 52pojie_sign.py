@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-吾爱破解论坛（52pojie.cn）自动签到脚本
+吾爱破解论坛（52pojie.cn）自动签到脚本 v2.0
 适配青龙面板
 
-环境变量配置：
-    export POJIE_COOKIE="你的cookie"
-    多账号用换行分隔，或 export POJIE_COOKIE="账号1cookie&账号2cookie"
+环境变量：
+    export POJIE_COOKIE="你的完整cookie"
+    多账号用 & 或换行分隔
 
 Cookie获取方法：
     1. 浏览器登录吾爱破解论坛
-    2. F12打开开发者工具 → Network → 刷新页面
-    3. 找到任意 52pojie.cn 请求，复制 Request Headers 中的 Cookie
-    4. 只需要包含登录状态的cookie即可（如 9fd7a_auth, 9fd7a_saltkey 等）
+    2. F12 → Network → 刷新页面
+    3. 找到 forum.php 或 home.php 请求
+    4. 复制 Request Headers 中的完整 Cookie
+    5. 必须包含 9fd7a_auth 和 9fd7a_saltkey 等字段
 
 更新时间：2026-08-07
 """
@@ -24,26 +25,25 @@ import sys
 import time
 import json
 import requests
-from urllib.parse import urlencode
+from urllib.parse import unquote
 
-# 尝试导入青龙面板的 notify 模块
+# 青龙面板通知模块
 try:
     from notify import send
 except ImportError:
     def send(title, content):
-        print(f"【{title}】\n{content}")
+        print(f"\n【通知】{title}\n{content}\n")
 
-# ============ 配置区域 ============
-# 签到URL
+# ============ 配置 ============
 BASE_URL = "https://www.52pojie.cn"
 HOME_URL = f"{BASE_URL}/forum.php"
-TASK_URL = f"{BASE_URL}/home.php?mod=task&do=apply&id=2"
+TASK_APPLY_URL = f"{BASE_URL}/home.php?mod=task&do=apply&id=2"
+TASK_DRAW_URL = f"{BASE_URL}/home.php?mod=task&do=draw&id=2"
 
-# 请求头
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
@@ -54,235 +54,253 @@ HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
-# ============ 日志输出 ============
+# ============ 工具函数 ============
 def log(msg, level="INFO"):
-    """统一日志输出"""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    level_tag = f"[{level}]"
-    print(f"{timestamp} {level_tag:8} {msg}")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    tag = {"INFO": "[INFO]", "WARN": "[WARN]", "ERROR": "[ERROR]", "DEBUG": "[DEBUG]"}.get(level, "[INFO]")
+    print(f"{ts} {tag:8} {msg}")
     return msg
 
 
-# ============ Cookie处理 ============
-def parse_cookies(cookie_str):
-    """解析cookie字符串为字典"""
+def parse_cookie(cookie_str):
+    """解析cookie字符串"""
     cookies = {}
     if not cookie_str:
         return cookies
-
     for item in cookie_str.split(";"):
         item = item.strip()
         if "=" in item:
-            key, value = item.split("=", 1)
-            cookies[key.strip()] = value.strip()
+            k, v = item.split("=", 1)
+            cookies[k.strip()] = v.strip()
     return cookies
 
 
-def get_cookie_str(cookies_dict):
-    """将cookie字典转为字符串"""
-    return "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-
-
-# ============ 核心签到逻辑 ============
-class PojieSign:
+# ============ 核心类 ============
+class PojieSigner:
     def __init__(self, cookie_str, index=1):
-        self.cookie_str = cookie_str.strip()
+        self.raw_cookie = cookie_str.strip()
         self.index = index
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self.session.headers["Cookie"] = self.cookie_str
-        # 禁用SSL警告
+        self.session.headers["Cookie"] = self.raw_cookie
         requests.packages.urllib3.disable_warnings()
         self.session.verify = False
-
-        # 解析cookie获取用户名（如果有）
         self.username = f"账号{index}"
-        cookies = parse_cookies(self.cookie_str)
-        # 尝试从cookie中获取用户名信息
-        if "9fd7a_olympichosts" in cookies:
+
+        # 从cookie尝试提取用户名
+        ck = parse_cookie(self.raw_cookie)
+        if "9fd7a_olympichosts" in ck:
             try:
-                import urllib.parse
-                decoded = urllib.parse.unquote(cookies.get("9fd7a_olympichosts", ""))
-                # 简单提取
-                self.username = f"账号{index}"
+                decoded = unquote(ck["9fd7a_olympichosts"])
+                # 尝试解析用户名
+                if "username" in decoded or "user" in decoded:
+                    self.username = f"账号{index}"
             except:
                 pass
 
+    def _request(self, method, url, **kwargs):
+        """统一请求方法，带重试"""
+        max_retry = 2
+        for i in range(max_retry + 1):
+            try:
+                resp = self.session.request(method, url, timeout=20, **kwargs)
+                return resp
+            except requests.exceptions.Timeout:
+                log(f"【{self.username}】请求超时 ({i+1}/{max_retry+1}): {url}", "WARN")
+                if i < max_retry:
+                    time.sleep(2)
+            except Exception as e:
+                log(f"【{self.username}】请求异常 ({i+1}/{max_retry+1}): {str(e)}", "ERROR")
+                if i < max_retry:
+                    time.sleep(1)
+        return None
+
+    def check_login(self):
+        """检查登录状态 - 多种方式"""
+        log(f"【{self.username}】正在检查登录状态...")
+
+        # 方式1: 访问首页，检查是否包含"您需要先登录"
+        resp = self._request("GET", HOME_URL)
+        if resp is None:
+            return False, "网络请求失败，无法连接论坛"
+
+        text = resp.text
+
+        # 调试: 保存部分响应内容用于排查
+        if "DEBUG_POJIE" in os.environ:
+            log(f"【{self.username}】首页响应前500字符: {text[:500]}", "DEBUG")
+
+        # 判断是否包含登录提示
+        if "您需要先登录才能继续本操作" in text:
+            return False, "Cookie已失效，页面提示需要登录"
+
+        # 方式2: 检查是否有登出链接（登录后才有）
+        logout_patterns = [
+            r'href=["\']member\.php\?mod=logging&action=logout',
+            r'退出',
+            r'logout',
+        ]
+        has_logout = any(re.search(p, text) for p in logout_patterns)
+
+        # 方式3: 检查是否有个人中心/设置等登录后才有的元素
+        login_indicators = [
+            "个人中心", "我的帖子", "设置", "用户中心", "space.php",
+            "home.php?mod=space", "mod=spacecp", "9fd7a_auth"
+        ]
+        has_login_indicator = any(ind in text for ind in login_indicators)
+
+        # 方式4: 检查cookie中是否包含关键登录字段
+        ck = parse_cookie(self.raw_cookie)
+        has_auth_cookie = "9fd7a_auth" in ck or "9fd7a_saltkey" in ck
+
+        log(f"【{self.username}】登录检查: has_logout={has_logout}, has_indicator={has_login_indicator}, has_auth={has_auth_cookie}")
+
+        # 综合判断: 有登出链接 或 有登录标识 或 有auth cookie，认为已登录
+        if has_logout or has_login_indicator:
+            # 尝试提取用户名
+            name_match = re.search(r'title=["\']访问我的空间["\'][^>]*>([^<]+)</a>', text)
+            if name_match:
+                self.username = name_match.group(1).strip()
+            return True, f"登录状态正常 (用户名: {self.username})"
+
+        if has_auth_cookie:
+            # 有auth cookie但页面没显示登录状态，可能是cookie不完整
+            return True, "Cookie包含登录凭证，继续尝试签到"
+
+        # 如果页面既没有登录提示也没有登出链接，可能是网络问题或页面异常
+        # 保守处理: 继续尝试，让后续签到流程自己判断
+        return True, "无法100%确认登录状态，但将继续尝试签到"
+
     def get_formhash(self):
         """从首页获取formhash"""
-        try:
-            log(f"【{self.username}】正在获取 formhash...")
-            resp = self.session.get(HOME_URL, timeout=15)
+        log(f"【{self.username}】正在获取 formhash...")
 
-            if resp.status_code != 200:
-                log(f"【{self.username}】获取首页失败，状态码: {resp.status_code}", "ERROR")
-                return None
-
-            # 检查是否登录
-            if "登录" in resp.text and "注册" in resp.text and "您需要先登录" not in resp.text:
-                # 可能未登录，但继续尝试获取formhash
-                pass
-
-            # 提取formhash - 多种匹配方式
-            patterns = [
-                r'<input[^>]*name=["\']formhash["\'][^>]*value=["\']([^"\']+)["\']',
-                r'name=["\']formhash["\']\s+value=["\']([^"\']+)["\']',
-                r'formhash=([a-z0-9]{8})',
-                r'<a[^>]*href=["\']member\.php\?mod=logging&action=logout&formhash=([^"\']+)["\']',
-            ]
-
-            for pattern in patterns:
-                match = re.search(pattern, resp.text)
-                if match:
-                    formhash = match.group(1)
-                    log(f"【{self.username}】获取 formhash 成功: {formhash}")
-                    return formhash
-
-            log(f"【{self.username}】未能从页面提取到 formhash", "WARN")
+        resp = self._request("GET", HOME_URL)
+        if not resp:
             return None
 
-        except Exception as e:
-            log(f"【{self.username}】获取 formhash 异常: {str(e)}", "ERROR")
-            return None
+        text = resp.text
 
-    def check_login_status(self):
-        """检查登录状态"""
-        try:
-            resp = self.session.get(HOME_URL, timeout=15)
-            # 如果页面包含"登录"和"注册"按钮，且没有用户中心相关链接，可能未登录
-            if "您需要先登录才能继续本操作" in resp.text:
-                return False, "Cookie已失效，需要重新登录"
-            if "个人中心" in resp.text or "我的" in resp.text or "设置" in resp.text:
-                return True, "登录状态正常"
-            # 尝试通过其他方式判断
-            if "9fd7a_auth" in self.cookie_str or "9fd7a_saltkey" in self.cookie_str:
-                return True, "Cookie格式看起来正常"
-            return False, "无法确认登录状态"
-        except Exception as e:
-            return False, f"检查登录状态异常: {str(e)}"
+        # 多种匹配方式
+        patterns = [
+            r'<input[^>]*name=["\']formhash["\'][^>]*value=["\']([a-f0-9]{8})["\']',
+            r'formhash=([a-f0-9]{8})',
+            r'<a[^>]*href=["\']member\.php\?mod=logging&action=logout&formhash=([a-f0-9]{8})["\']',
+            r'name=["\']formhash["\']\s+value=["\']([a-f0-9]{8})["\']',
+        ]
 
-    def do_sign(self):
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                formhash = match.group(1)
+                log(f"【{self.username}】获取 formhash 成功: {formhash}")
+                return formhash
+
+        log(f"【{self.username}】未能提取到 formhash，将尝试不带formhash签到", "WARN")
+        return None
+
+    def sign(self):
         """执行签到"""
-        results = []
+        log(f"========== 开始签到【{self.username}】 ==========")
 
-        # 1. 检查登录状态
-        is_login, login_msg = self.check_login_status()
+        # 1. 检查登录
+        is_login, login_msg = self.check_login()
         if not is_login:
             log(f"【{self.username}】{login_msg}", "ERROR")
             return False, login_msg
-
         log(f"【{self.username}】{login_msg}")
 
         # 2. 获取formhash
         formhash = self.get_formhash()
-        if not formhash:
-            # 尝试不带formhash直接签到
-            log(f"【{self.username}】未获取到formhash，尝试直接签到...", "WARN")
 
-        # 3. 执行签到请求
-        try:
-            # 吾爱破解的签到是通过任务系统实现的
-            # 先访问任务页面
-            log(f"【{self.username}】正在访问任务页面...")
-            task_resp = self.session.get(TASK_URL, timeout=15)
+        # 3. 先访问任务页面查看状态
+        log(f"【{self.username}】正在访问任务页面...")
+        task_resp = self._request("GET", TASK_APPLY_URL)
+        if not task_resp:
+            return False, "访问任务页面失败"
 
-            task_text = task_resp.text
+        task_text = task_resp.text
 
-            # 判断任务状态
-            if "任务已完成" in task_text or "已申请过" in task_text or "本期您已申请过此任务" in task_text:
-                msg = "今日已签到"
-                log(f"【{self.username}】{msg}")
-                return True, msg
+        # 调试模式保存响应
+        if "DEBUG_POJIE" in os.environ:
+            log(f"【{self.username}】任务页面关键词: 任务已完成={'任务已完成' in task_text}, 已申请={'已申请过' in task_text}, 登录提示={'您需要先登录' in task_text}", "DEBUG")
 
-            if "您需要先登录才能继续本操作" in task_text:
-                msg = "Cookie已失效，请重新获取"
-                log(f"【{self.username}】{msg}", "ERROR")
-                return False, msg
+        # 判断任务状态
+        if "您需要先登录才能继续本操作" in task_text:
+            return False, "Cookie失效，任务页面要求登录"
 
-            # 如果页面显示可以申请任务，则提交申请
-            if "申请任务" in task_text or "立即申请" in task_text:
-                # 构造POST数据
-                post_data = {
-                    "formhash": formhash if formhash else "",
-                    "tasksubmit": "true",
-                }
+        if "任务已完成" in task_text or "已申请过" in task_text or "本期您已申请过此任务" in task_text:
+            return True, "今日已签到"
 
-                # 提交任务申请
-                log(f"【{self.username}】正在提交签到申请...")
-                submit_url = f"{BASE_URL}/home.php?mod=task&do=apply&id=2"
-                submit_resp = self.session.post(submit_url, data=post_data, timeout=15)
+        if "不是您当前的任务" in task_text:
+            return True, "今日已签到（任务已结束）"
 
-                submit_text = submit_resp.text
+        # 4. 提交签到申请
+        log(f"【{self.username}】正在提交签到申请...")
+        post_data = {
+            "formhash": formhash if formhash else "",
+            "tasksubmit": "true",
+        }
 
-                if "任务已完成" in submit_text or "申请成功" in submit_text:
-                    msg = "签到成功"
-                    log(f"【{self.username}】{msg}")
-                    return True, msg
-                elif "已申请过" in submit_text or "本期您已申请过此任务" in submit_text:
-                    msg = "今日已签到（重复申请）"
-                    log(f"【{self.username}】{msg}")
-                    return True, msg
-                elif "您需要先登录" in submit_text:
-                    msg = "Cookie失效"
-                    log(f"【{self.username}】{msg}", "ERROR")
-                    return False, msg
-                else:
-                    msg = f"签到状态未知，响应包含: {submit_text[:200]}"
-                    log(f"【{self.username}】{msg}", "WARN")
-                    return False, msg
-            else:
-                # 尝试另一种签到方式 - 直接GET带参数
-                sign_url = f"{BASE_URL}/home.php?mod=task&do=draw&id=2"
-                log(f"【{self.username}】尝试领取任务奖励...")
-                draw_resp = self.session.get(sign_url, timeout=15)
+        submit_resp = self._request("POST", TASK_APPLY_URL, data=post_data)
+        if not submit_resp:
+            return False, "提交签到申请失败"
 
-                if "任务已完成" in draw_resp.text or "领取成功" in draw_resp.text:
-                    msg = "签到成功（领取奖励）"
-                    log(f"【{self.username}】{msg}")
-                    return True, msg
-                elif "已申请过" in draw_resp.text:
-                    msg = "今日已签到"
-                    log(f"【{self.username}】{msg}")
-                    return True, msg
-                else:
-                    msg = "无法确定签到状态，可能今日已签到或页面结构变更"
-                    log(f"【{self.username}】{msg}", "WARN")
-                    # 保守返回成功，避免重复通知
-                    return True, msg
+        submit_text = submit_resp.text
 
-        except requests.exceptions.Timeout:
-            msg = "请求超时"
-            log(f"【{self.username}】{msg}", "ERROR")
-            return False, msg
-        except Exception as e:
-            msg = f"签到异常: {str(e)}"
-            log(f"【{self.username}】{msg}", "ERROR")
-            return False, msg
+        if "任务已完成" in submit_text or "申请成功" in submit_text:
+            return True, "签到成功"
+        elif "已申请过" in submit_text or "本期您已申请过此任务" in submit_text:
+            return True, "今日已签到"
+        elif "您需要先登录" in submit_text:
+            return False, "Cookie失效"
+        else:
+            # 尝试领取奖励
+            log(f"【{self.username}】申请结果不明确，尝试领取奖励...")
+            draw_resp = self._request("GET", TASK_DRAW_URL)
+            if draw_resp:
+                draw_text = draw_resp.text
+                if "任务已完成" in draw_text or "领取成功" in draw_text:
+                    return True, "签到成功（领取奖励）"
+                elif "已申请过" in draw_text or "不是您当前的任务" in draw_text:
+                    return True, "今日已签到"
+
+            # 如果还是不行，检查是否已签到
+            if "不是您当前的任务" in task_text or "不是您当前的任务" in submit_text:
+                return True, "今日已签到（任务状态已结束）"
+
+            return False, f"签到状态未知，请开启DEBUG模式排查"
 
     def run(self):
-        """运行签到流程"""
-        log(f"========== 开始签到【账号{self.index}】 ==========")
-        success, msg = self.do_sign()
-        status = "✅ 成功" if success else "❌ 失败"
-        log(f"========== 签到结果【账号{self.index}】: {status} - {msg} ==========")
-        return success, msg
+        """运行签到"""
+        try:
+            success, msg = self.sign()
+            status = "✅ 成功" if success else "❌ 失败"
+            log(f"========== 结果【{self.username}】: {status} - {msg} ==========")
+            return success, msg
+        except Exception as e:
+            log(f"【{self.username}】签到异常: {str(e)}", "ERROR")
+            import traceback
+            log(traceback.format_exc(), "DEBUG")
+            return False, f"异常: {str(e)}"
 
 
-# ============ 主入口 ============
+# ============ 主程序 ============
 def main():
-    log("=" * 50)
-    log("吾爱破解论坛（52pojie.cn）自动签到脚本启动")
-    log("=" * 50)
+    log("=" * 60)
+    log("吾爱破解论坛自动签到脚本 v2.0 启动")
+    log("=" * 60)
 
-    # 从环境变量读取cookie
+    # 读取环境变量
     cookie_env = os.environ.get("POJIE_COOKIE", "")
 
     if not cookie_env:
-        log("未配置环境变量 POJIE_COOKIE，请先在青龙面板配置", "ERROR")
-        log("配置方法：青龙面板 → 环境变量 → 新建 → 名称: POJIE_COOKIE，值: 你的cookie", "INFO")
+        log("错误: 未设置环境变量 POJIE_COOKIE", "ERROR")
+        log("请在青龙面板 → 环境变量中添加: 名称=POJIE_COOKIE, 值=你的Cookie", "INFO")
+        log("Cookie获取: 浏览器F12 → Network → 找到52pojie.cn请求 → 复制Cookie", "INFO")
         sys.exit(1)
 
-    # 解析多账号（支持 & 或换行分隔）
+    # 解析多账号
     cookies = []
     if "&" in cookie_env:
         cookies = [c.strip() for c in cookie_env.split("&") if c.strip()]
@@ -290,47 +308,48 @@ def main():
         cookies = [c.strip() for c in cookie_env.split("\n") if c.strip()]
 
     if not cookies:
-        log("未解析到有效的cookie，请检查环境变量配置", "ERROR")
+        log("未解析到有效的Cookie，请检查配置", "ERROR")
         sys.exit(1)
 
     log(f"共检测到 {len(cookies)} 个账号")
 
     # 执行签到
-    all_results = []
-    for idx, cookie in enumerate(cookies, start=1):
-        signer = PojieSign(cookie, idx)
+    results = []
+    for idx, cookie in enumerate(cookies, 1):
+        signer = PojieSigner(cookie, idx)
         success, msg = signer.run()
-        all_results.append((idx, success, msg))
-        time.sleep(2)  # 账号间间隔，避免请求过快
+        results.append((idx, signer.username, success, msg))
+        if idx < len(cookies):
+            time.sleep(3)  # 账号间隔
 
-    # 汇总结果
-    log("=" * 50)
+    # 汇总
+    log("=" * 60)
     log("签到汇总")
-    log("=" * 50)
+    log("=" * 60)
 
     summary_lines = []
     success_count = 0
-    for idx, success, msg in all_results:
-        status = "✅" if success else "❌"
-        line = f"账号{idx}: {status} {msg}"
+    for idx, name, success, msg in results:
+        icon = "✅" if success else "❌"
+        line = f"账号{idx}({name}): {icon} {msg}"
         summary_lines.append(line)
         log(line)
         if success:
             success_count += 1
 
     summary = "\n".join(summary_lines)
-    title = f"吾爱破解签到 - {success_count}/{len(cookies)} 成功"
+    title = f"吾爱破解签到 {success_count}/{len(cookies)} 成功"
 
     # 发送通知
     try:
         send(title, summary)
         log("通知发送成功")
     except Exception as e:
-        log(f"通知发送失败: {str(e)}", "WARN")
+        log(f"通知发送失败: {e}", "WARN")
 
-    log("=" * 50)
+    log("=" * 60)
     log("脚本执行完毕")
-    log("=" * 50)
+    log("=" * 60)
 
 
 if __name__ == "__main__":
